@@ -1,0 +1,10 @@
+# Print header
+echo "timestamp,name,cpu,mem_usage,mem_limit,mem_percent" > bob_stats.csv
+
+# Sample every 1 second, append to CSV
+while true; do
+    docker stats --no-stream --format "{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}}" \
+      $(docker ps --filter "name=as3-bob" -q) \
+    | awk -v ts="$(date +%H:%M:%S)" '{print ts","$0}' >> bob_stats.csv
+    sleep 1
+done
