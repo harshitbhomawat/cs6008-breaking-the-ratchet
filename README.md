@@ -60,12 +60,49 @@ Name file according to n and pn.
 ```bash
 # Full reset (server + client state)
 docker compose down -v
-
-# Server only
-docker compose down
-
-# Client state only
-docker volume rm as3_as3state
 ```
 
 **Attack0 Completed**
+
+
+
+**To Perform Attack2**
+
+**Terminal 1 — Compile and Start Server**
+Set **do_complete_mitm = true;** for complete MITM in attack2.cpp
+
+```bash
+g++ -std=c++17 -O2 -pthread -o attacks/attack2.exe attacks/attack2.cpp -lcrypto
+```
+
+To run:
+```bash
+./attacks/attack2.exe 9000 2
+```
+
+
+
+**Terminal 2 — Bob** (must run before Alice)
+```bash
+docker compose run --rm bob /client --server-addr host.docker.internal --port 9000
+```
+
+**Terminal 3 — Alice**
+```bash
+docker compose run --rm alice /client --server-addr host.docker.internal --port 9000
+```
+
+
+## Send a Message
+
+In Alice's terminal: select `1` → enter `bob` → type message → `Ctrl+D` to exit chat.  
+
+## Reset
+
+**Reset docker**
+```bash
+# Full reset (server + client state)
+docker compose down -v
+```
+
+**Attack2 Completed**

@@ -27,7 +27,7 @@ mutex state_mutex;
 unordered_map<string, string> client_states;
 unordered_map<string, vector<string>> stored_opks, mailboxes;
 
-bool do_complete_mitm = true; //when turn on Bob will not be able to detect MITM
+bool do_complete_mitm = false; //when turn on Bob will not be able to detect MITM
 
 //constants
 
