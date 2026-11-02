@@ -1,0 +1,17 @@
+Attack 1: exhausting OPKs for target 'bob'
+Server: 127.0.0.1:9000, workers: 5, fetch limit: 10
+
+request,worker,type,opk_id,remaining,error
+1,3,bundle,7,3,
+2,1,bundle,9,1,
+3,4,bundle,6,4,
+4,0,bundle,10,-1,
+5,2,bundle,8,2,
+6,4,err,0,-1,no one-time prekeys available for bob
+7,3,err,0,-1,no one-time prekeys available for bob
+
+Summary
+  Bundles allocated: 5
+  Unique non-zero OPK IDs: 5
+  Empty-inventory refusals: 2
+OPK exhaustion demonstrated. Start Alice with fresh state and request Bob's bundle to confirm that a legitimate new session is denied.
